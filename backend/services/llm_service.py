@@ -10,10 +10,33 @@
 # - _build_context 组装引用来源时保留文件名+页码+段落号，供 Citation 溯源展示
 
 import time
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from openai import OpenAI
 from backend.config import settings
 from backend.models.schemas import Citation
+
+# ── bge-reranker-base 重排序模型 ──
+# 决策记录：
+# - 使用 CrossEncoder 而非 BiEncoder：CrossEncoder 直接建模 query-doc 相关性，精度更高
+# - 懒加载：首次调用 rerank 时初始化，不占用启动时间
+# - 输入为混合检索 top-20 候选，输出精排后 top-5
+# - 面试重点：Rerank 是工业级 RAG 标准流程中"检索→精排→生成"的关键中间环节
+_RERANKER_INSTANCE = None  # 模块级单例
+
+def _get_reranker() -> Optional[Any]:
+    """懒加载 CrossEncoder 重排序模型（单例，避免重复加载到显存）"""
+    global _RERANKER_INSTANCE
+    if _RERANKER_INSTANCE is not None:
+        return _RERANKER_INSTANCE
+    try:
+        from sentence_transformers import CrossEncoder
+        print(f"正在加载重排序模型: {settings.RERANK_MODEL}...")
+        _RERANKER_INSTANCE = CrossEncoder(settings.RERANK_MODEL)
+        print("重排序模型加载完成！")
+        return _RERANKER_INSTANCE
+    except Exception as e:
+        print(f"重排序模型加载失败，将跳过 rerank: {e}")
+        return None
 
 class LLMService:
     def __init__(self):
@@ -75,6 +98,48 @@ class LLMService:
 请给出你的回答："""
         
         return prompt
+    
+    def rerank_results(self, question: str, 
+                      candidates: List[Dict[str, Any]], 
+                      top_k: int = 5) -> List[Dict[str, Any]]:
+        """使用 CrossEncoder 对候选结果重排序
+        
+        Args:
+            question: 原始查询问题
+            candidates: 混合检索返回的候选结果列表
+            top_k: 精排后返回的 top-k 条结果
+            
+        Returns:
+            精排后的结果列表（按相关性降序）
+        """
+        if not candidates:
+            return []
+        
+        reranker = _get_reranker()
+        if reranker is None:
+            # 重排序模型加载失败，直接取前 top_k 条
+            return candidates[:top_k]
+        
+        # 构建 query-doc 对，供 CrossEncoder 打分
+        pairs = [[question, cand['content']] for cand in candidates]
+        
+        import numpy as np
+        try:
+            scores = reranker.predict(pairs)
+        except Exception as e:
+            print(f"Rerank 预测失败，回退到原始排序: {e}")
+            return candidates[:top_k]
+        
+        # 将 CrossEncoder 分数附加到结果中
+        for i, cand in enumerate(candidates):
+            cand['rerank_score'] = float(scores[i])
+            # 用 rerank 分数覆盖 score，确保 LLM 看到的是精排后的相关性
+            cand['score'] = float(scores[i])
+        
+        # 按 rerank 分数降序排列
+        reranked = sorted(candidates, key=lambda x: x['score'], reverse=True)
+        
+        return reranked[:top_k]
     
     def generate_answer(self, question: str, 
                        search_results: List[Dict[str, Any]],

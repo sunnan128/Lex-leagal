@@ -298,50 +298,52 @@ class VectorStoreService:
     
     def hybrid_search(self, query: str, top_k: int = 5, 
                      semantic_weight: float = 0.7, 
-                     keyword_weight: float = 0.3) -> List[Dict[str, Any]]:
-        semantic_results = self.semantic_search(query, top_k * 2)
-        keyword_results = self.keyword_search(query, top_k * 2)
+                     keyword_weight: float = 0.3,
+                     rerank_candidates: int = 0) -> List[Dict[str, Any]]:
+        # 当启用 rerank 时，对内部语义/关键词检索取更多候选
+        internal_k = max(top_k * 2, rerank_candidates) if rerank_candidates > 0 else top_k * 2
+        semantic_results = self.semantic_search(query, internal_k)
+        keyword_results = self.keyword_search(query, internal_k)
         
-        combined = {}
+        combined = {}  # doc_id -> { id, content, metadata, total_score }
         
         for result in semantic_results:
             doc_id = result['id']
             combined[doc_id] = {
+                'id': doc_id,
                 'content': result['content'],
                 'metadata': result['metadata'],
-                'semantic_score': result['score'],
-                'keyword_score': 0.0,
                 'total_score': result['score'] * semantic_weight
             }
         
         for result in keyword_results:
             doc_id = result['id']
             if doc_id in combined:
-                combined[doc_id]['keyword_score'] = result['score']
                 combined[doc_id]['total_score'] += result['score'] * keyword_weight
             else:
                 combined[doc_id] = {
+                    'id': doc_id,
                     'content': result['content'],
                     'metadata': result['metadata'],
-                    'semantic_score': 0.0,
-                    'keyword_score': result['score'],
                     'total_score': result['score'] * keyword_weight
                 }
         
+        # 最终取 top N（rerank 时取更多候选供精排，否则取 top_k）
+        final_k = rerank_candidates if rerank_candidates > 0 else top_k
         sorted_results = sorted(
             combined.values(),
             key=lambda x: x['total_score'],
             reverse=True
-        )[:top_k]
+        )[:final_k]
         
         return [
             {
-                'id': list(combined.keys())[i],
+                'id': r['id'],
                 'content': r['content'],
                 'metadata': r['metadata'],
                 'score': r['total_score']
             }
-            for i, r in enumerate(sorted_results)
+            for r in sorted_results
         ]
     
     def delete_document(self, document_id: str) -> int:

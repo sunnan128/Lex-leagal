@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # 嵌入模型：可用 paraphrase-multilingual-MiniLM-L12-v2 替代以加快速度
     EMBEDDING_MODEL: str = "BAAI/bge-large-zh-v1.5"
     RERANK_MODEL: str = "BAAI/bge-reranker-base"
+    RERANK_CANDIDATES: int = 20  # 混合检索返回的候选数，供 rerank 精排后取 top_k
     
     VECTOR_DB_TYPE: str = "chroma"
     CHROMA_PERSIST_DIR: str = "./backend/data/chroma"

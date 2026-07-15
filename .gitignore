@@ -44,6 +44,10 @@ backend/data/*.pkl
 *.swp
 *.swo
 
+# 不上传deployment.md
+deployment.md
+
+
 # 截图与演示图片
 001*.jpg
 002*.png
@@ -52,3 +56,6 @@ backend/data/*.pkl
 005*.png
 006*.png
 案例*.png
+
+#_private/
+_private/

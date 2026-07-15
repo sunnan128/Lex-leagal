@@ -194,7 +194,19 @@ class QAService:
             raise e
     
     async def query(self, request: QueryRequest) -> QueryResponse:
-        if request.use_keyword_search:
+        if request.use_rerank:
+            # ── Rerank 流程：混合检索取 top-20 → CrossEncoder 精排 → top-5 ──
+            # 决策记录：工业级 RAG 标准流程，bge-reranker-base 对 query-doc 对
+            # 逐对打分，比简单加权融合（混合检索）精度更高
+            candidates = self.vector_store.hybrid_search(
+                request.question,
+                top_k=request.top_k,
+                rerank_candidates=settings.RERANK_CANDIDATES  # 默认 20
+            )
+            search_results = self.llm_service.rerank_results(
+                request.question, candidates, request.top_k
+            )
+        elif request.use_keyword_search:
             search_results = self.vector_store.hybrid_search(
                 request.question, 
                 request.top_k
