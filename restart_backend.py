@@ -10,7 +10,6 @@ import os
 import sys
 import time
 import subprocess
-import signal
 
 PORT = 8002
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,18 +37,17 @@ def find_process_on_port(port: int) -> list:
 
 
 def kill_processes(pids: list):
-    """强制终止进程列表"""
+    """强制终止进程列表（Windows 用 taskkill /F，避免 os.kill 不兼容）"""
     for pid in pids:
         try:
-            os.kill(pid, signal.SIGTERM)
-            print(f"  已终止 PID {pid}")
-        except (OSError, PermissionError) as e:
-            try:
-                subprocess.run(f'taskkill /F /PID {pid}', shell=True,
-                               capture_output=True, timeout=5)
-                print(f"  已强制终止 PID {pid}")
-            except Exception:
-                print(f"  无法终止 PID {pid}: {e}")
+            result = subprocess.run(
+                f'taskkill /F /PID {pid}',
+                shell=True, capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                print(f"  已终止 PID {pid}")
+        except Exception as e:
+            print(f"  无法终止 PID {pid}: {e}")
 
 
 def restart_backend() -> bool:

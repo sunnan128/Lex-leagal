@@ -10,12 +10,13 @@
 # - _build_context 组装引用来源时保留文件名+页码+段落号，供 Citation 溯源展示
 
 import time
+import os
 from typing import List, Dict, Any, Tuple, Optional
 from openai import OpenAI
 from backend.config import settings
 from backend.models.schemas import Citation
 
-# ── bge-reranker-base 重排序模型 ──
+# ── bge-reranker-large 重排序模型 ──
 # 决策记录：
 # - 使用 CrossEncoder 而非 BiEncoder：CrossEncoder 直接建模 query-doc 相关性，精度更高
 # - 懒加载：首次调用 rerank 时初始化，不占用启动时间
@@ -23,16 +24,42 @@ from backend.models.schemas import Citation
 # - 面试重点：Rerank 是工业级 RAG 标准流程中"检索→精排→生成"的关键中间环节
 _RERANKER_INSTANCE = None  # 模块级单例
 
+def _reranker_cache_dir() -> str:
+    """返回重排序模型在本地缓存的目录路径"""
+    # SENTENCE_TRANSFORMERS_HOME 已在 vector_store.py 中设为 ./backend/data/model_cache
+    cache_home = os.environ.get('SENTENCE_TRANSFORMERS_HOME', './backend/data/model_cache')
+    # HuggingFace hub 缓存格式: models--BAAI--bge-reranker-large
+    model_slug = f"models--{settings.RERANK_MODEL.replace('/', '--')}"
+    return os.path.join(cache_home, model_slug)
+
+def _is_reranker_cached() -> bool:
+    """检查重排序模型是否已下载到本地缓存"""
+    cache_dir = _reranker_cache_dir()
+    if not os.path.exists(cache_dir):
+        return False
+    snapshots_dir = os.path.join(cache_dir, 'snapshots')
+    if not os.path.exists(snapshots_dir):
+        return False
+    snapshots = os.listdir(snapshots_dir)
+    return len(snapshots) > 0
+
 def _get_reranker() -> Optional[Any]:
-    """懒加载 CrossEncoder 重排序模型（单例，避免重复加载到显存）"""
+    """懒加载 CrossEncoder 重排序模型（单例，避免重复加载到显存）
+    
+    首次加载需要从 HuggingFace 下载模型（仅一次）并缓存到本地磁盘。
+    后续重启/热重载后直接从磁盘加载，无需再次下载。
+    """
     global _RERANKER_INSTANCE
     if _RERANKER_INSTANCE is not None:
         return _RERANKER_INSTANCE
     try:
         from sentence_transformers import CrossEncoder
-        print(f"正在加载重排序模型: {settings.RERANK_MODEL}...")
+        is_cached = _is_reranker_cached()
+        if not is_cached:
+            print(f"⏳ 首次加载重排序模型: {settings.RERANK_MODEL}（下载后永久缓存）...")
         _RERANKER_INSTANCE = CrossEncoder(settings.RERANK_MODEL)
-        print("重排序模型加载完成！")
+        if not is_cached:
+            print(f"✅ 重排序模型加载完成！")
         return _RERANKER_INSTANCE
     except Exception as e:
         print(f"重排序模型加载失败，将跳过 rerank: {e}")

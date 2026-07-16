@@ -57,5 +57,7 @@ deployment.md
 006*.png
 案例*.png
 
+solo/
+
 #_private不上传
 _private/

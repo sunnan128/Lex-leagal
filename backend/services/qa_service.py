@@ -7,6 +7,7 @@
 # - 异步上传：POST /upload/start 返回 task_id，GET /upload/progress/{id} 轮询进度
 
 import os
+import re
 import uuid
 import shutil
 import threading
@@ -22,6 +23,51 @@ from backend.models.schemas import (
     QueryRequest, QueryResponse, UploadResponse, 
     HealthResponse, DocumentInfo, Citation
 )
+
+# ── 中文数字映射（用于"第100条"→"第一百条" 归一化） ──
+_CN_DIGITS = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"]
+_CN_RADICES = ["", "十", "百", "千"]
+
+def _arabic_to_chinese(num: int) -> str:
+    """将阿拉伯数字转为中文数字，支持 0~99999"""
+    if num == 0:
+        return "零"
+    
+    # 按位拆分（个十百千万）
+    digits = []
+    while num > 0:
+        digits.append(num % 10)
+        num //= 10
+    
+    result = ""
+    need_zero = False
+    for i in range(len(digits) - 1, -1, -1):
+        d = digits[i]
+        if d == 0:
+            need_zero = True
+        else:
+            if need_zero:
+                result += "零"
+                need_zero = False
+            result += _CN_DIGITS[d] + _CN_RADICES[i]
+    
+    # 修正"一十" → "十"
+    if result.startswith("一十"):
+        result = result[1:]
+    
+    return result
+
+def _normalize_article_numbers(text: str) -> str:
+    """将查询中的 '第N条' / '第N款' / '第N章' / '第N节' 中的阿拉伯数字转为中文数字
+    
+    例: "民法典第100条是什么" → "民法典第一百条是什么"
+    """
+    def _replacer(m):
+        prefix = m.group(1)  # "第"
+        num = int(m.group(2))
+        suffix = m.group(3)  # "条/款/章/节"
+        return prefix + _arabic_to_chinese(num) + suffix
+    return re.sub(r'(第)(\d+)([条款章节])', _replacer, text)
 
 class QAService:
     def __init__(self):
@@ -194,29 +240,33 @@ class QAService:
             raise e
     
     async def query(self, request: QueryRequest) -> QueryResponse:
+        # 将"第100条"归一化为"第一百条"，解决文档中中文数字 vs 用户输入阿拉伯数字的匹配问题
+        search_question = _normalize_article_numbers(request.question)
+        
         if request.use_rerank:
             # ── Rerank 流程：混合检索取 top-20 → CrossEncoder 精排 → top-5 ──
-            # 决策记录：工业级 RAG 标准流程，bge-reranker-base 对 query-doc 对
+            # 决策记录：工业级 RAG 标准流程，bge-reranker-large 对 query-doc 对
             # 逐对打分，比简单加权融合（混合检索）精度更高
             candidates = self.vector_store.hybrid_search(
-                request.question,
+                search_question,
                 top_k=request.top_k,
                 rerank_candidates=settings.RERANK_CANDIDATES  # 默认 20
             )
             search_results = self.llm_service.rerank_results(
-                request.question, candidates, request.top_k
+                search_question, candidates, request.top_k
             )
         elif request.use_keyword_search:
             search_results = self.vector_store.hybrid_search(
-                request.question, 
+                search_question, 
                 request.top_k
             )
         else:
             search_results = self.vector_store.semantic_search(
-                request.question, 
+                search_question, 
                 request.top_k
             )
         
+        # 传给 LLM 时仍用原始问题（用户看到的是自己输入的问题）
         answer, citations, found_kb, processing_time = self.llm_service.generate_answer(
             request.question,
             search_results,

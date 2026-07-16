@@ -503,6 +503,16 @@ with tab_doc:
 # Tab 2：法律检索
 # ═══════════════════════════════════════════════
 
+# 初始化上次提交记录和最新结果
+if "last_question" not in st.session_state:
+    st.session_state.last_question = ""
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "search_clicked" not in st.session_state:
+    st.session_state.search_clicked = False
+if "input_key" not in st.session_state:
+    st.session_state.input_key = 0
+
 with tab_qa:
     st.markdown('<div class="card-title" style="border-bottom:none;margin-bottom:0.5rem;">🔍 法律条文检索</div>', unsafe_allow_html=True)
 
@@ -515,65 +525,89 @@ with tab_qa:
         with c3:
             use_keyword = st.checkbox("关键词模式", value=True, help="同时启用关键词精确匹配")
 
+    # ── 输入框（按回车 或 点击"检索"按钮均可触发） ──
     question = st.text_input(
         "## 输入法律问题",
         placeholder="例：民法典第584条关于违约损害赔偿的范围如何规定？",
-        label_visibility="collapsed"
+        label_visibility="collapsed",
+        key=f"qa_input_{st.session_state.input_key}"
     )
 
-    if st.button("检索并生成回答", type="primary", use_container_width=True):
-        if question:
-            with st.spinner("正在检索知识库，请稍候…"):
-                result = query_question(question, top_k, use_rerank, use_keyword)
+    # 检索按钮（位于输入框下方，均匀分布）
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        search_btn = st.button("🔍 检索", type="primary", use_container_width=True)
+    with btn_col2:
+        clear_btn = st.button("清空", use_container_width=True)
 
-            if result:
-                st.markdown("#### 📝 法律意见")
+    if search_btn:
+        st.session_state.search_clicked = True
 
-                if result['found_in_knowledge_base']:
-                    st.markdown(f'<div class="answer-box">{result["answer"]}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="answer-box" style="border-left-color:#9ca3af;">⚠ {result["answer"]}</div>', unsafe_allow_html=True)
+    if clear_btn:
+        st.session_state.last_question = ""
+        st.session_state.last_result = None
+        st.session_state.search_clicked = False
+        st.session_state.input_key += 1
+        st.rerun()
 
-                # 引用来源
-                if result['citations']:
-                    st.markdown("#### 📎 引用溯源")
-                    for i, cite in enumerate(result['citations'], 1):
-                        location = []
-                        if cite['page_number']:
-                            location.append(f"第 {cite['page_number']} 页")
-                        if cite['paragraph_number']:
-                            location.append(f"第 {cite['paragraph_number']} 段")
-                        loc_str = " · ".join(location) if location else "全文检索"
-                        doc_id = cite.get('document_id', '')
-                        cite_page = cite.get('page_number', '')
-                        cite_para = cite.get('paragraph_number', '')
-                        view_url = f"{API_URL}/documents/{doc_id}/view"
-                        if cite_para:
-                            view_url += f"?page=1&para={cite_para}"
+    # 检测新提交：按回车（内容变化）或 点击"检索"按钮
+    trigger_search = (question and question != st.session_state.last_question) or \
+                     (question and st.session_state.search_clicked)
+    
+    if trigger_search:
+        st.session_state.last_question = question
+        st.session_state.search_clicked = False
+        with st.spinner("正在检索知识库，请稍候…"):
+            result = query_question(question, top_k, use_rerank, use_keyword)
+        if result:
+            st.session_state.last_result = {"question": question, "result": result}
 
-                        st.markdown(f"""
-                        <div class="citation-item">
-                            <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                                <strong style="font-size:0.9rem;">{cite['document_name']}</strong>
-                                <a href="{view_url}" target="_blank" 
-                                   style="font-size:0.75rem;color:#c9a84c;text-decoration:none;white-space:nowrap;margin-left:8px;"
-                                   title="查看该文档所有检索片段">
-                                   📄 查看原文 →
-                                </a>
-                            </div>
-                            <div class="citation-meta">
-                                <span>📖 {loc_str}</span>
-                                <span>🎯 相关度 {cite['score']:.4f}</span>
-                            </div>
-                            <div style="font-size:0.85rem;color:#4b5563;margin-top:0.4rem;line-height:1.6;">
-                                {cite['content']}
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+    # ── 显示当前检索结果（仅最新一次） ──
+    if st.session_state.last_result:
+        qa = st.session_state.last_result
+        st.markdown(f'<div style="font-family:\'Noto Serif SC\',serif;font-size:0.95rem;font-weight:600;color:#1a1a2e;background:#f3f2ee;border-radius:8px;padding:0.5rem 1rem;margin:0.5rem 0 0.25rem 0;">📝 {qa["question"]}</div>', unsafe_allow_html=True)
 
-                st.markdown(f'<span class="meta-tag">⏱ {result["processing_time_ms"]:.0f} ms</span>', unsafe_allow_html=True)
+        if qa['result']['found_in_knowledge_base']:
+            st.markdown(f'<div class="answer-box">{qa["result"]["answer"]}</div>', unsafe_allow_html=True)
         else:
-            st.warning("请输入法律问题。")
+            st.markdown(f'<div class="answer-box" style="border-left-color:#9ca3af;">⚠ {qa["result"]["answer"]}</div>', unsafe_allow_html=True)
+
+        if qa['result']['citations']:
+            st.markdown("#### 📎 引用溯源")
+            for cite in qa['result']['citations']:
+                location = []
+                if cite['page_number']:
+                    location.append(f"第 {cite['page_number']} 页")
+                if cite['paragraph_number']:
+                    location.append(f"第 {cite['paragraph_number']} 段")
+                loc_str = " · ".join(location) if location else "全文检索"
+                doc_id = cite.get('document_id', '')
+                cite_para = cite.get('paragraph_number', '')
+                view_url = f"{API_URL}/documents/{doc_id}/view"
+                if cite_para:
+                    view_url += f"?page=1&para={cite_para}"
+
+                st.markdown(f"""
+                <div class="citation-item">
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                        <strong style="font-size:0.9rem;">{cite['document_name']}</strong>
+                        <a href="{view_url}" target="_blank" 
+                           style="font-size:0.75rem;color:#c9a84c;text-decoration:none;white-space:nowrap;margin-left:8px;"
+                           title="查看该文档所有检索片段">
+                           📄 查看原文 →
+                        </a>
+                    </div>
+                    <div class="citation-meta">
+                        <span>📖 {loc_str}</span>
+                        <span>🎯 相关度 {cite['score']:.4f}</span>
+                    </div>
+                    <div style="font-size:0.85rem;color:#4b5563;margin-top:0.4rem;line-height:1.6;">
+                        {cite['content']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown(f'<span class="meta-tag">⏱ {qa["result"]["processing_time_ms"]:.0f} ms</span>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
