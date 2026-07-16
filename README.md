@@ -247,6 +247,3 @@ LLM_MODEL=deepseek-chat
 
 修改 `.env` 中的 `EMBEDDING_MODEL` 配置，支持所有 Sentence-Transformers 模型。
 
-## 许可证
-
-MIT License
