@@ -57,7 +57,19 @@ deployment.md
 006*.png
 案例*.png
 
+# 所有图片
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.svg
+*.webp
+*.ico
+
+# solo 文件夹
 solo/
+
 
 #_private不上传
 _private/

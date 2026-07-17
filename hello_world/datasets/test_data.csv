@@ -1,0 +1,11 @@
+id,query,expected_output
+1,What is the capital of France?,Paris
+2,What is 2 + 2?,4
+3,What is the largest mammal?,Blue Whale
+4,Who developed the theory of relativity?,Einstein
+5,What is the programming language used for data science?,Python
+6,What is the highest mountain in the world?,Mount Everest
+7,Who wrote 'Romeo and Juliet'?,Shakespeare
+8,What is the fourth planet from the Sun?,Mars
+9,What is the name of the fruit that keeps the doctor away?,Apple
+10,Who painted the Mona Lisa?,Leonardo da Vinci
