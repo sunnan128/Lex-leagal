@@ -23,3 +23,4 @@ python-multipart==0.0.6
 aiofiles==23.2.1
 httpx==0.26.0
 ragas>=0.1.0
+langsmith>=0.1.0

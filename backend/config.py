@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "./backend/data/uploads"
     MAX_UPLOAD_SIZE: int = 10485760
     
+    # LangSmith 可观测性配置
+    LANGSMITH_API_KEY: str = ""
+    LANGSMITH_PROJECT: str = "default"
+    LANGSMITH_TRACING: bool = False
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -16,6 +16,23 @@ from openai import OpenAI
 from backend.config import settings
 from backend.models.schemas import Citation
 
+# ── LangSmith 全链路追踪（条件化集成） ──
+if settings.LANGSMITH_TRACING:
+    # 将配置注入环境变量，langsmith SDK 从 os.environ 读取
+    os.environ.setdefault("LANGSMITH_API_KEY", settings.LANGSMITH_API_KEY)
+    os.environ.setdefault("LANGSMITH_PROJECT", settings.LANGSMITH_PROJECT)
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    from langsmith import traceable
+    from langsmith.wrappers import wrap_openai
+else:
+    # 关闭时使用无操作装饰器与包装函数，零额外开销
+    def traceable(*args, **kwargs):
+        if args and callable(args[0]):
+            return args[0]
+        return lambda x: x
+    def wrap_openai(client):
+        return client
+
 # ── bge-reranker-large 重排序模型 ──
 # 决策记录：
 # - 使用 CrossEncoder 而非 BiEncoder：CrossEncoder 直接建模 query-doc 相关性，精度更高
@@ -67,10 +84,10 @@ def _get_reranker() -> Optional[Any]:
 
 class LLMService:
     def __init__(self):
-        self.client = OpenAI(
+        self.client = wrap_openai(OpenAI(
             api_key=settings.OPENAI_API_KEY,
             base_url=settings.OPENAI_BASE_URL
-        )
+        ))
         self.model = settings.LLM_MODEL
     
     def _build_context(self, search_results: List[Dict[str, Any]]) -> Tuple[str, List[Citation]]:
@@ -126,6 +143,7 @@ class LLMService:
         
         return prompt
     
+    @traceable(run_type="chain")
     def rerank_results(self, question: str, 
                       candidates: List[Dict[str, Any]], 
                       top_k: int = 5) -> List[Dict[str, Any]]:
@@ -160,14 +178,25 @@ class LLMService:
         # 将 CrossEncoder 分数附加到结果中
         for i, cand in enumerate(candidates):
             cand['rerank_score'] = float(scores[i])
-            # 用 rerank 分数覆盖 score，确保 LLM 看到的是精排后的相关性
-            cand['score'] = float(scores[i])
         
         # 按 rerank 分数降序排列
-        reranked = sorted(candidates, key=lambda x: x['score'], reverse=True)
+        reranked = sorted(candidates, key=lambda x: x['rerank_score'], reverse=True)
+        
+        # ── 安全兜底：若 CrossEncoder 最高分低于阈值，说明模型对全部候选置信度不足 ──
+        # 此时回退到原始混合检索排序，避免用不可靠的 rerank 分数覆盖有用结果
+        RERANK_CONFIDENCE_THRESHOLD = 0.1
+        if reranked and reranked[0]['rerank_score'] < RERANK_CONFIDENCE_THRESHOLD:
+            print(f"Rerank 最高分 {reranked[0]['rerank_score']:.4f} 低于阈值 {RERANK_CONFIDENCE_THRESHOLD}，"
+                  f"回退到混合检索排序")
+            return candidates[:top_k]
+        
+        # 置信度达标，用 rerank 分数覆盖 score，确保 LLM 看到的是精排后的相关性
+        for cand in reranked:
+            cand['score'] = cand['rerank_score']
         
         return reranked[:top_k]
     
+    @traceable(run_type="llm")
     def generate_answer(self, question: str, 
                        search_results: List[Dict[str, Any]],
                        use_rerank: bool = True) -> Tuple[str, List[Citation], bool, float]:

@@ -13,6 +13,20 @@ from typing import List, Dict, Any, Optional, Tuple
 from backend.config import settings
 from backend.utils.document_parser import DocumentChunk
 
+# ── LangSmith 全链路追踪（条件化集成） ──
+if settings.LANGSMITH_TRACING:
+    # 将配置注入环境变量，langsmith SDK 从 os.environ 读取
+    os.environ.setdefault("LANGSMITH_API_KEY", settings.LANGSMITH_API_KEY)
+    os.environ.setdefault("LANGSMITH_PROJECT", settings.LANGSMITH_PROJECT)
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    from langsmith import traceable
+else:
+    # 关闭时使用无操作装饰器，零额外开销
+    def traceable(*args, **kwargs):
+        if args and callable(args[0]):
+            return args[0]
+        return lambda x: x
+
 # Hugging Face 镜像配置（国内用户无法直连 HF）
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['TRANSFORMERS_CACHE'] = './backend/data/model_cache'
@@ -296,6 +310,7 @@ class VectorStoreService:
         
         return results
     
+    @traceable(run_type="retriever")
     def hybrid_search(self, query: str, top_k: int = 5, 
                      semantic_weight: float = 0.7, 
                      keyword_weight: float = 0.3,
@@ -307,26 +322,41 @@ class VectorStoreService:
         
         combined = {}  # doc_id -> { id, content, metadata, total_score }
         
+        # ── 归一化：将语义相似度和 BM25 分数都映射到 [0, 1] 再加权融合 ──
+        # 背景: ChromaDB 返回的距离经 1/(1+d) 转换后 ∈ (0,1]，
+        #       而 BM25 分数可高达 10+，量级不匹配，直接加权会导致语义被淹没
+        
+        # 步骤1: 语义检索结果 → 相似度 ∈ (0, 1]
         for result in semantic_results:
             doc_id = result['id']
+            # ChromaDB 返回的是距离（越小越相似），转为相似度（越大越相似）
+            semantic_similarity = 1.0 / (1.0 + result['score'])
             combined[doc_id] = {
                 'id': doc_id,
                 'content': result['content'],
                 'metadata': result['metadata'],
-                'total_score': result['score'] * semantic_weight
+                'total_score': semantic_similarity * semantic_weight,
+                '_sem_score': semantic_similarity
             }
         
-        for result in keyword_results:
-            doc_id = result['id']
-            if doc_id in combined:
-                combined[doc_id]['total_score'] += result['score'] * keyword_weight
-            else:
-                combined[doc_id] = {
-                    'id': doc_id,
-                    'content': result['content'],
-                    'metadata': result['metadata'],
-                    'total_score': result['score'] * keyword_weight
-                }
+        # 步骤2: BM25 关键词检索结果 → 归一化到 [0, 1]
+        if keyword_results:
+            max_kw_score = max(r['score'] for r in keyword_results)
+            if max_kw_score > 0:
+                for result in keyword_results:
+                    doc_id = result['id']
+                    normalized_kw = result['score'] / max_kw_score  # [0, 1]
+                    if doc_id in combined:
+                        combined[doc_id]['total_score'] += normalized_kw * keyword_weight
+                    else:
+                        combined[doc_id] = {
+                            'id': doc_id,
+                            'content': result['content'],
+                            'metadata': result['metadata'],
+                            'total_score': normalized_kw * keyword_weight,
+                            '_sem_score': 0.0
+                        }
+        # 纯语义结果兜底（BM25为空时已有 semantic_similarity * weight）
         
         # 最终取 top N（rerank 时取更多候选供精排，否则取 top_k）
         final_k = rerank_candidates if rerank_candidates > 0 else top_k

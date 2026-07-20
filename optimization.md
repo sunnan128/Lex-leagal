@@ -62,6 +62,8 @@
 | **评估层** | ⑳ | RAGAS 自动评估流水线 | 优化效果全凭感觉 | 一键运行，输出 faithfulness/answer_relevancy/context_precision/context_recall 四大指标 |
 | **评估层** | ⑴ | 优化前后 A/B 对比报告 | 无法证明优化有效 | 同一数据集、不同配置，自动生成对比报告 + 一句话总结 |
 | **评估层** | ⑵ | LLM-as-a-Judge | 人工评估成本高、不可复现 | RAGAS 不可用时自动降级，仍可量化知识库覆盖率等关键指标 |
+| **后端** | ㉑ | 混合检索分数归一化 | ChromaDB L2 距离（越小越相似）直接与 BM25（越大越相关）相加排序，语义排序方向相反 | 相关文档正确进入候选集，rerank 模式下"故意杀人罪"检索从 0 条恢复正常 |
+| **模型层** | ㉒ | Rerank 置信度回退 | CrossEncoder 低置信度仍覆盖原始排序，导致 LLM 上下文被无关文档污染 | 低于 0.1 阈值自动回退混合检索排序，保障结果稳定性 |
 
 ---
 
@@ -1022,3 +1024,113 @@ else:
 | **评估层** | 你说 Rerank 提升了 15%，数据是哪里来的？ | 同一数据集（10领域30条QA）、同一 API、仅切换 use_rerank 参数，`eval/comparison.py` 自动生成对比报告 |
 | **评估层** | 评估数据集怎么保证质量？ | 每条 QA 对含标准法律条文 answer + ground truth，涉及 10 个法律领域，数据源为《民法典》《劳动合同法》等正式法条 |
 | **评估层** | 为什么不直接用人工评估？ | 30 条人工评估需 2~3 小时，不可复现；自动化评估 3~5 分钟，可反复跑、可复现、可对比不同版本 |
+| **后端** | 开启 Rerank 后搜"故意杀人罪"反而没结果？ | ChromaDB L2 距离（越小越相似）直接当分数与 BM25 相加排序，语义方向相反。修复为 `1/(1+d)` 转相似度 + BM25 归一化到 [0,1]再加权 |
+| **模型层** | CrossEncoder 给出低分时会不会丢掉好结果？ | 增加置信度回退：最高分低于 0.1 时自动用混合检索排序，Rerank 只做精排不做过滤 |
+
+---
+
+### ㉑ 混合检索分数归一化
+
+#### 问题
+
+开启 Rerank 后，用户搜索"关于故意杀人罪如何规定"得到零结果；而不开启 Rerank 时不论是否开启关键词检索模式，都能正常返回。
+
+#### 根因
+
+[`vector_store.py`](backend/services/vector_store.py) 中的 `hybrid_search()` 存在**两处分数融合 Bug**：
+
+**Bug A — 语义距离方向相反**
+
+ChromaDB 返回的距离（L2 距离，越小=越相似）直接被当作"总分"与 BM25 分数相加：
+
+```python
+# 修复前
+'total_score': result['score'] * semantic_weight  # score = distance, lower=better
+```
+
+然后对总分降序排列：`sorted(..., reverse=True)` → **距离越大排越前**，语义排序完全颠倒！
+
+**Bug B — BM25 分数量级碾压**
+
+BM25 分数可高达 8~10+，而语义距离约 0.5~1.5（越大越不相似）。未归一化时，BM25 加权贡献（10×0.3=3.0）远超语义贡献（0.5×0.7=0.35），检索结果被只匹配"关于""规定"等高频词的无关文档占据。
+
+**连锁反应**：rerank 模式下 `hybrid_search` 取 top-20 候选全部无关，CrossEncoder 无从精排→LLM 上下文被污染→返回"未找到相关信息"。
+
+#### 修复
+
+两处修改均在 [`vector_store.py`](backend/services/vector_store.py) 的 `hybrid_search()` 方法中：
+
+**修复 A — 距离转相似度**：
+
+```python
+# 修复后
+semantic_similarity = 1.0 / (1.0 + result['score'])  # distance → (0, 1]
+```
+
+将 ChromaDB L2 距离通过 `1/(1+d)` 映射到 (0, 1]，数值越大=越相似。
+
+**修复 B — BM25 归一化**：
+
+```python
+# 修复后
+max_kw_score = max(r['score'] for r in keyword_results)
+if max_kw_score > 0:
+    normalized_kw = result['score'] / max_kw_score  # [0, 1]
+```
+
+将 BM25 分数归一化到 [0, 1]，与语义相似度在同一量级上加权融合。
+
+最终公式：`total_score = similarity×0.7 + normalized_bm25×0.3`
+
+#### 对比
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| 语义分数处理 | 原始 L2 距离（越小越好）作为分数 | `1/(1+d)` 转为相似度（越大越好） |
+| BM25 分数处理 | 原始分数（0~10+）直接参与加权 | 归一化到 [0,1] 后参与加权 |
+| top-20 候选含"故意杀人"文档数 | 0 条（测试查询） | 4 条 |
+| Rerank 搜索结果 | "未找到相关信息" | 准确返回第 232 条内容 |
+
+---
+
+### ㉒ Rerank 置信度回退
+
+#### 问题
+
+即使 `hybrid_search` 返回了正确的候选集，CrossEncoder 的预测分数也可能因模型局限性、文本长度、领域差异等原因失去区分度（所有候选分数极低）。此时若仍用 rerank 分数覆盖原始排序，会导致好结果被丢弃。
+
+#### 根因
+
+[`llm_service.py`](backend/services/llm_service.py) 的 `rerank_results()` 方法中，CrossEncoder 分数直接覆盖 `candidates[i]['score']`，没有置信度校验：
+
+```python
+# 修复前：无条件覆盖
+candidates[i]['score'] = float(scores[i])
+reranked = sorted(candidates, key=lambda x: x['score'], reverse=True)
+```
+
+对于"关于故意杀人罪如何规定"这个查询，bge-reranker-large 对所有 20 个候选的评分均低于 0.09（最高分仅 ~0.0885），完全无法区分相关性。此时用 rerank 排序只会打乱原本正确的混合检索排序。
+
+#### 修复
+
+在 [`llm_service.py`](backend/services/llm_service.py) 的 `rerank_results()` 中增加置信度回退：
+
+```python
+# 修复后：置信度不足时回退
+RERANK_CONFIDENCE_THRESHOLD = 0.1
+if reranked and reranked[0]['rerank_score'] < RERANK_CONFIDENCE_THRESHOLD:
+    return candidates[:top_k]  # 回退到混合检索原始排序
+```
+
+逻辑：
+1. CrossEncoder 打分后，检查最高分是否低于阈值（0.1）
+2. 低于阈值 → 模型对全部候选缺乏信心 → 回退到 `candidates[:top_k]`（即混合检索原始排序）
+3. 高于阈值 → 正常使用 rerank 排序结果
+
+#### 对比
+
+| 场景 | 修复前 | 修复后 |
+|------|--------|--------|
+| CrossEncoder 高分差明显（>0.1） | ✅ 正常精排 | ✅ 正常精排 |
+| CrossEncoder 全部低分（<0.1） | ❌ 排序被不可靠分数打乱 | ✅ 回退混合检索，保留好结果 |
+| CrossEncoder 模型加载失败 | ✅ 回退 candidates[:top_k]（已有） | ✅ 不变 |
