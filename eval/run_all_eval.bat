@@ -1,46 +1,44 @@
 @echo off
 chcp 65001 >nul
-title LexAI 一键评估
+title LexAI Eval
 
 echo ========================================
-echo   LexAI 一键评估脚本
-echo   模式：Baseline + Rerank
+echo   LexAI Evaluation - All Modes
 echo ========================================
 echo.
 
 set VENV_PYTHON=%~dp0..\.venv\Scripts\python.exe
 if not exist "%VENV_PYTHON%" (
-    echo ❌ 未找到虚拟环境 Python: %VENV_PYTHON%
-    echo    请确认 .venv 存在
+    echo [ERROR] Virtual env python not found: %VENV_PYTHON%
     pause
     exit /b 1
 )
 
-echo 检查后端连接...
+echo Checking backend connection...
 curl -s http://localhost:8002/health >nul 2>&1
 if errorlevel 1 (
-    echo ❌ 后端服务未运行，请先启动后端
-    echo    启动命令：.\.venv\Scripts\python -m uvicorn backend.main:app --host 0.0.0.0 --port 8002
+    echo [ERROR] Backend not running on port 8002.
+    echo   Start it first: .\.venv\Scripts\python -m uvicorn backend.main:app --host 0.0.0.0 --port 8002
     pause
     exit /b 1
 )
-echo ✅ 后端连接正常
+echo [OK] Backend connected
 echo.
 
-echo [1/2] 评估 Baseline 模式（无 Rerank）...
+echo [1/2] Running Baseline mode (w/o Rerank)...
 "%VENV_PYTHON%" -m eval.run_eval --mode baseline
 echo.
 
-echo [2/2] 评估 Rerank 模式（带 Rerank）...
+echo [2/2] Running Rerank mode...
 "%VENV_PYTHON%" -m eval.run_eval --mode rerank
 echo.
 
 echo ========================================
-echo   ✅ 评估完成！
-echo   结果文件:
+echo   Done!
+echo   Results:
 echo     eval\results\baseline_metrics.json
 echo     eval\results\rerank_metrics.json
 echo.
-echo   运行对比报告: eval\run_comparison.bat
+echo   Run comparison: eval\run_comparison.bat
 echo ========================================
 pause

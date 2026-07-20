@@ -77,12 +77,11 @@ def _compute_self_metrics(results: List[Dict]) -> Dict:
 
     found_count = sum(1 for r in results if r.get('found_in_knowledge_base', False))
     avg_time = sum(r.get('processing_time_ms', 0) for r in results) / total
-    avg_citations = sum(len(r.get('citations', [])) for r in results) / total
+    avg_citations = sum(r.get('num_citations', 0) for r in results) / total
 
     citation_scores = []
     for r in results:
-        for c in r.get('citations', []):
-            citation_scores.append(c.get('score', 0))
+        citation_scores.extend(r.get('citation_scores', []))
     avg_citation_score = sum(citation_scores) / len(citation_scores) if citation_scores else 0
     coverage = found_count / total
 
