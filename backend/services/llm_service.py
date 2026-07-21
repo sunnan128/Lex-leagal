@@ -33,7 +33,7 @@ else:
     def wrap_openai(client):
         return client
 
-# ── bge-reranker-large 重排序模型 ──
+# ── bge-reranker 重排序模型 ──
 # 决策记录：
 # - 使用 CrossEncoder 而非 BiEncoder：CrossEncoder 直接建模 query-doc 相关性，精度更高
 # - 懒加载：首次调用 rerank 时初始化，不占用启动时间
@@ -45,7 +45,7 @@ def _reranker_cache_dir() -> str:
     """返回重排序模型在本地缓存的目录路径"""
     # SENTENCE_TRANSFORMERS_HOME 已在 vector_store.py 中设为 ./backend/data/model_cache
     cache_home = os.environ.get('SENTENCE_TRANSFORMERS_HOME', './backend/data/model_cache')
-    # HuggingFace hub 缓存格式: models--BAAI--bge-reranker-large
+    # HuggingFace hub 缓存格式: models--BAAI--bge-reranker-base
     model_slug = f"models--{settings.RERANK_MODEL.replace('/', '--')}"
     return os.path.join(cache_home, model_slug)
 

@@ -56,7 +56,7 @@
 | **接入层-部署** | ⑭ | 后端自恢复脚本 | 后端进程崩溃、端口被占用时前端卡死 | `restart_backend.py` 检测端口 → 清理残留 → 重启后端 → 等待就绪，前端一键恢复 |
 | **接入层-前端** | ⑮ | 文档预览页跳转框 | 浏览检索片段时无法快速定位 | 支持"片段号"和"原段落号"双模式跳转，跨页自动逐页搜索 |
 | **接入层-前端** | ⑯ | 引用卡片直达定位 | 查看原文后需要手动翻页找引用位置 | 点击"查看原文"自动带上段落号参数，预览页加载后自动搜索并高亮定位 |
-| **模型层** | ⑰ | bge-reranker-large 重排序 | 混合检索加权融合无精排，相关度不够精确 | CrossEncoder 精排 top-20 → top-5，召回精确度显著提升 |
+| **模型层** | ⑰ | bge-reranker-base 重排序 | 混合检索加权融合无精排，相关度不够精确 | CrossEncoder 精排 top-20 → top-5，召回精确度显著提升 |
 | **数据层** | ⑱ | 阿拉伯数字→中文数字归一化 | "民法典第100条"语义/关键词都无法匹配"民法典第一百条" | 自动将查询中"第N条"的阿拉伯数字转为中文，检索命中率大幅提升 |
 | **评估层** | ⑲ | RAGAS 评估数据集 | 优化效果无法量化，没有评估基准 | 30条QA对、10个法律领域，构建可复现的评估基准 |
 | **评估层** | ⑳ | RAGAS 自动评估流水线 | 优化效果全凭感觉 | 一键运行，输出 faithfulness/answer_relevancy/context_precision/context_recall 四大指标 |
@@ -198,7 +198,7 @@ embeddings = self.embedding_model.encode(documents, show_progress_bar=True).toli
 
 ---
 
-### ⑰ bge-reranker-large 重排序精排
+### ⑰ bge-reranker-base 重排序精排
 
 #### 问题
 
@@ -208,14 +208,14 @@ embeddings = self.embedding_model.encode(documents, show_progress_bar=True).toli
 
 #### 优化
 
-引入 **bge-reranker-large** CrossEncoder 重排序模型，在混合检索之后加一层精排：
+引入 **bge-reranker-base** CrossEncoder 重排序模型（由 `bge-reranker-base` 配置项指定），在混合检索之后加一层精排：
 
 ```
 用户 Query
     ↓
 混合检索（语义 0.7 + BM25 0.3）→ 取 top-20 候选
     ↓
-bge-reranker-large CrossEncoder 精排打分
+bge-reranker-base CrossEncoder 精排打分
     ↓
 取 top-5 给 LLM 生成回答
 ```
@@ -225,7 +225,7 @@ bge-reranker-large CrossEncoder 精排打分
 ##### ① config.py — 新增配置项
 
 ```python
-RERANK_MODEL: str = "BAAI/bge-reranker-large"
+RERANK_MODEL: str = "BAAI/bge-reranker-base"
 RERANK_CANDIDATES: int = 20  # 混合检索返回的候选数，供 rerank 精排后取 top_k
 ```
 
@@ -1007,9 +1007,9 @@ else:
 | **数据层** | 搜"民法典第100条"查不到"民法典第一百条"怎么办？ | 查询归一化：自动将"第N条/款/章/节"中的阿拉伯数字转为中文数字，BM25 匹配率从 0% 提升到 100% |
 | **存储层** | 内存不够怎么办？ | BM25 索引 pickle 磁盘持久化，启动速度从秒级降到毫秒级 |
 | **模型层** | 模型下载不了怎么处理的？ | 6 层降级策略 + HF 镜像 + ModelScope 国内源 + 本地缓存优先 |
-| **模型层** | 怎么保证检索结果最相关？ | 混合检索（粗排）→ bge-reranker-large CrossEncoder 精排（细排），工业级 RAG 标准流程 |
+| **模型层** | 怎么保证检索结果最相关？ | 混合检索（粗排）→ bge-reranker-base CrossEncoder 精排（细排），工业级 RAG 标准流程 |
 | **模型层** | 为什么用 CrossEncoder 而非 BiEncoder 做 Rerank？ | CrossEncoder 直接建模 query-doc 交互，精度更高；BiEncoder 虽可预编码但无法捕捉深层交互 |
-| **模型层** | Rerank 增加了多少延迟？ | bge-reranker-large 推理 20 对 ~500ms，精度收益远大于延迟成本 |
+| **模型层** | Rerank 增加了多少延迟？ | bge-reranker-base 推理 20 对 ~500ms，精度收益远大于延迟成本 |
 | **后端** | 多文件上传报错怎么修的？ | 元数据索引越界 Bug，用 `enumerate` 替代动态索引计算 |
 | **后端** | 服务重启文档丢了怎么办？ | ChromaDB 元数据恢复机制，重启后自动回填文档列表 |
 | **后端** | 重启后的文档删不掉怎么办？ | 恢复时同步写入内存缓存 + 兜底直接走 ChromaDB 删除 |
@@ -1110,7 +1110,7 @@ candidates[i]['score'] = float(scores[i])
 reranked = sorted(candidates, key=lambda x: x['score'], reverse=True)
 ```
 
-对于"关于故意杀人罪如何规定"这个查询，bge-reranker-large 对所有 20 个候选的评分均低于 0.09（最高分仅 ~0.0885），完全无法区分相关性。此时用 rerank 排序只会打乱原本正确的混合检索排序。
+对于"关于故意杀人罪如何规定"这个查询，bge-reranker-base 对所有 20 个候选的评分均低于 0.09（最高分仅 ~0.0885），完全无法区分相关性。此时用 rerank 排序只会打乱原本正确的混合检索排序。
 
 #### 修复
 

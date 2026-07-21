@@ -245,7 +245,7 @@ class QAService:
         
         if request.use_rerank:
             # ── Rerank 流程：混合检索取 top-20 → CrossEncoder 精排 → top-5 ──
-            # 决策记录：工业级 RAG 标准流程，bge-reranker-large 对 query-doc 对
+            # 决策记录：工业级 RAG 标准流程，CrossEncoder 对 query-doc 对
             # 逐对打分，比简单加权融合（混合检索）精度更高
             candidates = self.vector_store.hybrid_search(
                 search_question,

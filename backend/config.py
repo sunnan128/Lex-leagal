@@ -6,7 +6,7 @@
 # - ChromaDB 持久化路径 ./backend/data/chroma：放在项目内便于打包迁移和文档同步
 # - Milvus 配置保留但未使用：为未来分布式扩展预留接口，当前单机 ChromaDB 足够
 # - 上传目录 ./backend/data/uploads 在 Settings 初始化时自动创建，无需手动建目录
-# - 混合检索: 语义检索 + BM25 关键词检索，权重 7:3
+# - 混合检索: RRF（Reciprocal Rank Fusion）替代加权求和，解决单路检索命中时被淹没的问题
 
 from pydantic_settings import BaseSettings
 from typing import Optional
