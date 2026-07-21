@@ -2,11 +2,18 @@
 # 决策记录：
 # - 6 层降级策略加载嵌入模型：本地缓存 → HF 镜像 → 轻量模型
 # - BM25 关键词索引持久化到磁盘 pickle，不在 RAM 中常驻
-# - 混合检索权重：语义 0.7 + 关键词 0.3
+# - 混合检索策略演进：加权求和(0.7+0.3) → RRF 融合 → RRF + 层级关联评分
 # - Bug 修复: add_documents 中 metadatas 索引原为 len(all_docs)-len(chunks)，
 #   上传第二个文件时越界。已改为 enumerate(chunks) 正确索引。
+# - 层级关联评分（2026-07）：
+#   问题：条款块正文不含法律名称（如"第三十五条…"块中无"民法典"），
+#         BM25/语义均无法匹配，top-20 候选池不含目标文档。
+#   方案：_parse_hierarchical_query → 元数据补充检索 → _apply_hierarchical_scoring
+#         + 条款号归一化双向转换（阿拉伯↔中文数字）。
+#   关键设计：候选池参数 rerank_candidates=20 保持不变。
 
 import os
+import re
 import pickle
 import uuid
 from typing import List, Dict, Any, Optional, Tuple
@@ -93,6 +100,104 @@ def _download_default_embedding_model():
     model_dir = _download_model_from_modelscope(ms_model_name, MODEL_CACHE_DIR)
     if model_dir:
         return model_dir
+    
+    return None
+
+# ── 层级关联检索：条款号归一化辅助 ──
+# 决策记录：
+# - 动机：用户输入"第35条"（阿拉伯数字），文档写"第三十五条"（中文数字），
+#   BM25 分词后 token 完全不匹配，分数为 0。
+# - 方案：对"第N条/款/章/节"格式的字符串，实现阿拉伯↔中文数字双向转换。
+# - 与 qa_service.py 中已有归一化的关系：qa_service 是查询侧单向转换，
+#   此处是评分侧双向检查，确保无论用户输入哪种格式都能匹配文档内容。
+# - 边界情况：支持"十""百"等位数词，"一十"自动修正为"十"。
+
+_ARABIC_DIGITS = '0123456789'
+_CHINESE_NUM_SIMPLE = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九']
+
+def _number_to_chinese(num_str: str) -> str:
+    """将阿拉伯数字串转为中文数字（支持条款号场景）
+    
+    示例："" → "",  "1" → "一",  "35" → "三十五",  "100" → "一百"
+    """
+    if not num_str:
+        return ''
+    n = int(num_str)
+    if n == 0:
+        return '零'
+    units = ['', '十', '百', '千']
+    result = ''
+    digits = [int(d) for d in str(n)]
+    length = len(digits)
+    for i, d in enumerate(digits):
+        pos = length - 1 - i
+        if d == 0:
+            # 零只出现在非空结果且前一位非零时
+            if result and not result.endswith('零'):
+                result += '零'
+        else:
+            result += _CHINESE_NUM_SIMPLE[d]
+            if pos > 0:
+                result += units[pos]
+    # 去除末尾多余的零
+    result = result.rstrip('零')
+    # 处理"一十"开头的情况（如 10 → "十" 而非 "一十"）
+    if result.startswith('一十'):
+        result = result[1:]
+    return result
+
+def _chinese_to_number(chinese: str) -> Optional[str]:
+    """将中文数字转为阿拉伯数字字符串（支持条款号场景）
+    
+    示例："" → None, "一" → "1",  "三十五" → "35",  "一百" → "100"
+    """
+    if not chinese:
+        return None
+    _cn_map = {'零': 0, '一': 1, '二': 2, '三': 3, '四': 4,
+               '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+    _unit_map = {'十': 10, '百': 100, '千': 1000}
+    try:
+        total = 0
+        current = 0
+        for ch in chinese:
+            if ch in _cn_map:
+                current = _cn_map[ch]
+            elif ch in _unit_map:
+                if current == 0:
+                    current = 1
+                total += current * _unit_map[ch]
+                current = 0
+            else:
+                return None
+        total += current
+        return str(total)
+    except:
+        return None
+
+def _normalize_article_variant(article_str: str) -> Optional[str]:
+    """生成条款号的另一种书写形式（阿拉伯数字 ↔ 中文数字）
+    
+    示例：
+      "第35条"    → "第三十五条"
+      "第三十五条" → "第35条"
+      "第1条"     → "第一条"
+      "第一条"    → "第1条"
+      "第1章"     → "第一章"
+      "第100条"   → "第一百条"
+    """
+    match = re.match(r'^(第)(\d+)([条款章节])$', article_str)
+    if match:
+        prefix, num_str, suffix = match.groups()
+        chinese_num = _number_to_chinese(num_str)
+        return f'{prefix}{chinese_num}{suffix}'
+    
+    chinese_digits = set('零一二三四五六七八九十百千')
+    match = re.match(r'^(第)([零一二三四五六七八九十百千]+)([条款章节])$', article_str)
+    if match:
+        prefix, num_str, suffix = match.groups()
+        arabic = _chinese_to_number(num_str)
+        if arabic is not None:
+            return f'{prefix}{arabic}{suffix}'
     
     return None
 
@@ -310,71 +415,219 @@ class VectorStoreService:
         
         return results
     
+    # ── 层级关联查询解析 ──
+    # 决策记录：
+    # - 自动识别"法律名称+条款序号"类查询（如"民法典第35条"），
+    #   提取主体关键词"民法典"和子关键词"第35条"。
+    # - 仅适用于中文法律检索场景，正则匹配 "第X条/款/章/节" 格式。
+    # - 未匹配到时返回 (None, None)，hybrid_search 回退到旧版评分逻辑。
+    # - 多字法律名称也支持（如"中华人民共和国消费者权益保护法第35条"）。
+
+    @staticmethod
+    def _parse_hierarchical_query(query: str) -> Tuple[Optional[str], Optional[str]]:
+        """解析层级关联查询，提取「主体限定关键词」与「子匹配关键词」
+        
+        自动识别法律法规检索场景中"法律名称 + 条款序号"的结构化查询：
+          "民法典第35条"   → subject="民法典",  sub_key="第35条"
+          "民法典第三十五条" → subject="民法典",  sub_key="第三十五条"
+          "第35条"         → subject=None,    sub_key="第35条"
+          "第三十五条"     → subject=None,    sub_key="第三十五条"
+        
+        Returns:
+            (subject_key, sub_key) — 未检测到层级结构时返回 (None, None)
+        """
+        article_match = re.search(r'(第[零一二三四五六七八九十百千\d]+[条款章节])', query)
+        if not article_match:
+            return (None, None)
+        
+        sub_key = article_match.group(1)
+        before = query[:article_match.start()].strip()
+        
+        if not before:
+            return (None, sub_key)
+        
+        return (before, sub_key)
+
+    # ── 层级化相关度评分 ──
+    # 决策记录：
+    # - 主体判定依据：先检查元数据（文件名），再检查文档正文。
+    #   因为条款块正文不含法律名称（如"第三十五条…"块中无"民法典"），
+    #   但文件名含"中华人民共和国民法典_20200528.docx"。
+    # - 子关键词检查自动归一化（阿拉伯↔中文数字双向匹配）。
+    # - 三个梯次的加分值是经验值，基于 RRF 分数范围（≈0.017-0.095）确定：
+    #   0.03 确保 TIER-1 能超越大多数 RRF 结果，
+    #   0.01 使 TIER-2 略高于纯 RRF 中位水平，但低于 TIER-1。
+    # - 不修改候选池参数（rerank_candidates=20），仅在评分侧做调整。
+
+    @staticmethod
+    def _apply_hierarchical_scoring(
+        scored_items: List[Dict],
+        subject_key: Optional[str],
+        sub_key: Optional[str],
+    ) -> None:
+        """应用层级化相关度评分
+
+        实现"先限定主体范围，再匹配子关键词"的关联检索逻辑：
+        
+        主体判定依据：先检查文档内容的元数据（文件名），再检查文档正文。
+        这是因为法律文档的条款块内容通常不包含该法律的完整名称
+        （例如"第三十五条　监护人应按照…"块中不含"民法典"字样），
+        但文档文件名包含法律名称（如"中华人民共和国民法典_20200528.docx"）。
+        
+        子关键词自动归一化：同时检查阿拉伯数字和中文数字两种形式
+        （例如 sub_key="第35条" 也会匹配 "第三十五条"），
+        解决查询词与文档内容数字书写形式不一致的问题。
+        
+        **评分梯次**（从高到低）：
+          梯次①  主体 + 子关键词  →  base + 0.03  (高相关，精准命中)
+          梯次②  仅主体关键词    →  base + 0.01  (中等相关，在同一法律的文档内)
+          梯次③  仅子关键词/均无 →  base          (低相关，其他法律的同名条款)
+        
+        **场景示例**：查询"民法典第35条"
+          - 文件名含"民法典" + 内容含"第三十五条"/"第35条" → 梯次① ✓ 精准命中
+          - 文件名含"民法典"但内容无"第三十五条"/"第35条" → 梯次② 同一法律的其它条款
+          - 文件名不含"民法典"但内容含"第三十五条"/"第35条" → 梯次③ 其他法律同名条款
+        """
+        # 任一关键词为 None 时不执行层级评分
+        if subject_key is None or sub_key is None:
+            return
+        
+        FULL_MATCH_BOOST = 0.03    # 主体+子关键词，超越任何 RRF 单列得分
+        SUBJECT_ONLY_BOOST = 0.01  # 仅主体关键词，落后于全命中文档但领先于其他
+        
+        # 子关键词自动归一化：生成阿拉伯数字和中文数字两个变体
+        sub_variants = [sub_key]
+        alt_sub = _normalize_article_variant(sub_key)
+        if alt_sub and alt_sub != sub_key:
+            sub_variants.append(alt_sub)
+        
+        for item in scored_items:
+            content = item['content']
+            # 主体判定：从元数据（文件名）和文档内容两方面检查
+            metadata = item.get('metadata', {})
+            filename = metadata.get('filename', '') if isinstance(metadata, dict) else ''
+            
+            has_subject = (subject_key in content) or (subject_key in filename)
+            has_sub = any(v in content for v in sub_variants)
+            
+            if has_subject and has_sub:
+                item['score'] += FULL_MATCH_BOOST
+            elif has_subject:
+                item['score'] += SUBJECT_ONLY_BOOST
+            # 仅子关键词或都不命中：不额外加分
+
+    def _search_by_subject_metadata(self, subject_key: str) -> List[Dict[str, Any]]:
+        """通过元数据（文件名）检索归属于某法律主体的所有文档块
+        
+        法律文档的条款块内容通常不包含该法律的完整名称
+        （如"第三十五条　监护人应按照…"块中不含"民法典"字样），
+        但文件名中包含法律名称（如"..._中华人民共和国民法典_20200528.docx"）。
+        此方法通过文件名匹配来补充主体相关的文档块到候选池中，
+        确保层级检索不会遗漏那些正文不含主体名的条款块。
+        
+        Returns:
+            匹配的文档块列表（每项含 id/content/metadata，score 初始化为 0）
+        """
+        if not self.all_documents:
+            return []
+        results = []
+        for doc in self.all_documents:
+            meta = doc.get('metadata', {})
+            filename = meta.get('filename', '') if isinstance(meta, dict) else ''
+            if subject_key in filename:
+                results.append({
+                    'id': doc['id'],
+                    'content': doc['content'],
+                    'metadata': doc['metadata'],
+                    'score': 0.0  # 基础分，后续通过层级评分调整
+                })
+        return results
+
     @traceable(run_type="retriever")
     def hybrid_search(self, query: str, top_k: int = 5, 
                      semantic_weight: float = 0.7, 
                      keyword_weight: float = 0.3,
                      rerank_candidates: int = 0) -> List[Dict[str, Any]]:
+        # ── 步骤1: 解析层级关联查询 ──
+        subject_key, sub_key = self._parse_hierarchical_query(query)
+        
+        # ── 步骤2: RRF 混合检索 ──
         # 当启用 rerank 时，对内部语义/关键词检索取更多候选
         internal_k = max(top_k * 2, rerank_candidates) if rerank_candidates > 0 else top_k * 2
         semantic_results = self.semantic_search(query, internal_k)
         keyword_results = self.keyword_search(query, internal_k)
         
-        combined = {}  # doc_id -> { id, content, metadata, total_score }
+        # Reciprocal Rank Fusion (RRF)：基于排序位置融合，不依赖分数量级归一化
+        # RRF(d) = 1/(k + rank_sem(d)) + 1/(k + rank_kw(d))
+        RRF_K = 20
         
-        # ── 归一化：将语义相似度和 BM25 分数都映射到 [0, 1] 再加权融合 ──
-        # 背景: ChromaDB 返回的距离经 1/(1+d) 转换后 ∈ (0,1]，
-        #       而 BM25 分数可高达 10+，量级不匹配，直接加权会导致语义被淹没
+        sem_rank = {r['id']: i + 1 for i, r in enumerate(semantic_results)}
+        kw_rank = {r['id']: i + 1 for i, r in enumerate(keyword_results)}
         
-        # 步骤1: 语义检索结果 → 相似度 ∈ (0, 1]
-        for result in semantic_results:
-            doc_id = result['id']
-            # ChromaDB 返回的是距离（越小越相似），转为相似度（越大越相似）
-            semantic_similarity = 1.0 / (1.0 + result['score'])
-            combined[doc_id] = {
+        all_ids = set(sem_rank.keys()) | set(kw_rank.keys())
+        
+        scored = []
+        for doc_id in all_ids:
+            rank_sem = sem_rank.get(doc_id)
+            rank_kw = kw_rank.get(doc_id)
+            
+            rrf_score = 0.0
+            if rank_sem is not None:
+                rrf_score += 1.0 / (RRF_K + rank_sem)
+            if rank_kw is not None:
+                rrf_score += 1.0 / (RRF_K + rank_kw)
+            
+            if rank_sem is not None:
+                src = semantic_results[rank_sem - 1]
+            else:
+                src = keyword_results[rank_kw - 1]
+            
+            scored.append({
                 'id': doc_id,
-                'content': result['content'],
-                'metadata': result['metadata'],
-                'total_score': semantic_similarity * semantic_weight,
-                '_sem_score': semantic_similarity
-            }
+                'content': src['content'],
+                'metadata': src['metadata'],
+                'score': rrf_score
+            })
         
-        # 步骤2: BM25 关键词检索结果 → 归一化到 [0, 1]
-        if keyword_results:
-            max_kw_score = max(r['score'] for r in keyword_results)
-            if max_kw_score > 0:
-                for result in keyword_results:
-                    doc_id = result['id']
-                    normalized_kw = result['score'] / max_kw_score  # [0, 1]
-                    if doc_id in combined:
-                        combined[doc_id]['total_score'] += normalized_kw * keyword_weight
-                    else:
-                        combined[doc_id] = {
-                            'id': doc_id,
-                            'content': result['content'],
-                            'metadata': result['metadata'],
-                            'total_score': normalized_kw * keyword_weight,
-                            '_sem_score': 0.0
-                        }
-        # 纯语义结果兜底（BM25为空时已有 semantic_similarity * weight）
+        # ── 步骤3: 主体元数据补充检索 ──
+        # 决策记录：
+        # - 动机：条款块正文不含法律名称时 BM25/语义均无法命中，
+        #   即使 internal_k=40 也无法将目标文档纳入候选池。
+        # - 方案：通过文件名主动查找该法律所有文档块加入候选池，
+        #   基础分 0.02（≈RRF排名第30的单路分值），配合层级评分后合理排序。
+        # - 不修改 rerank_candidates=20，只在候选池内调整排序。
+        # - 如果目标文档已通过 RRF 进入候选池，不会重复添加（去重）。
+        if subject_key:
+            subject_docs = self._search_by_subject_metadata(subject_key)
+            existing_ids = {item['id'] for item in scored}
+            for sd in subject_docs:
+                if sd['id'] not in existing_ids:
+                    sd['score'] = 0.02  # 中等基础分，配合层级评分后合理排序
+                    scored.append(sd)
         
-        # 最终取 top N（rerank 时取更多候选供精排，否则取 top_k）
+        # ── 步骤4: 层级或关键词加分 ──
+        if subject_key and sub_key:
+            # 场景①：检测到"主体+子关键词"的层级结构
+            # 使用层级化评分，确保同时命中主体和子关键词的文档排在最前
+            self._apply_hierarchical_scoring(scored, subject_key, sub_key)
+        elif sub_key:
+            # 场景②：仅子关键词，无主体限定
+            # 兼容处理：对包含该条款号的文档给予基础加分
+            article_boost = 1.0 / RRF_K  # 0.05
+            for item in scored:
+                content = item['content']
+                alt_sub = _normalize_article_variant(sub_key)
+                sub_variants = [sub_key]
+                if alt_sub and alt_sub != sub_key:
+                    sub_variants.append(alt_sub)
+                if any(v in content for v in sub_variants):
+                    item['score'] += article_boost
+        
+        # ── 步骤5: 最终排序与截断 ──
         final_k = rerank_candidates if rerank_candidates > 0 else top_k
-        sorted_results = sorted(
-            combined.values(),
-            key=lambda x: x['total_score'],
-            reverse=True
-        )[:final_k]
+        scored.sort(key=lambda x: x['score'], reverse=True)
         
-        return [
-            {
-                'id': r['id'],
-                'content': r['content'],
-                'metadata': r['metadata'],
-                'score': r['total_score']
-            }
-            for r in sorted_results
-        ]
+        return scored[:final_k]
     
     def delete_document(self, document_id: str) -> int:
         results = self.collection.get(
